@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/deepch/vdk/av"
+	"github.com/blackbeans/vdk/av"
 )
 
 type Session struct {
@@ -22,6 +22,7 @@ type Media struct {
 	TimeScale          int
 	Control            string
 	Rtpmap             int
+	MediaProtocol      string
 	ChannelCount       int
 	Config             []byte
 	SpropParameterSets [][]byte
@@ -31,6 +32,8 @@ type Media struct {
 	PayloadType        int
 	SizeLength         int
 	IndexLength        int
+	ServerPort         string
+	ClientPort         string
 }
 
 func Parse(content string) (sess Session, medias []Media) {
@@ -54,6 +57,10 @@ func Parse(content string) (sess Session, medias []Media) {
 						medias = append(medias, Media{AVType: fields[0]})
 						media = &medias[len(medias)-1]
 						mfields := strings.Split(fields[1], " ")
+						if len(mfields) >= 2 {
+							//rtp/avp 或者 rtp/avp/tcp
+							media.MediaProtocol = mfields[1]
+						}
 						if len(mfields) >= 3 {
 							media.PayloadType, _ = strconv.Atoi(mfields[2])
 						}

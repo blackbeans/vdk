@@ -9,7 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	//"log"
+	"log"
 	"net"
 	"net/textproto"
 	"net/url"
@@ -17,13 +17,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/deepch/vdk/av"
-	"github.com/deepch/vdk/av/avutil"
-	"github.com/deepch/vdk/codec"
-	"github.com/deepch/vdk/codec/aacparser"
-	"github.com/deepch/vdk/codec/h264parser"
-	"github.com/deepch/vdk/format/rtsp/sdp"
-	"github.com/deepch/vdk/utils/bits/pio"
+	"github.com/blackbeans/vdk/av"
+	"github.com/blackbeans/vdk/av/avutil"
+	"github.com/blackbeans/vdk/codec"
+	"github.com/blackbeans/vdk/codec/aacparser"
+	"github.com/blackbeans/vdk/codec/h264parser"
+	"github.com/blackbeans/vdk/format/rtsp/sdp"
+	"github.com/blackbeans/vdk/utils/bits/pio"
 )
 
 var ErrCodecDataChange = fmt.Errorf("rtsp: codec data change, please call HandleCodecDataChange()")
@@ -84,6 +84,40 @@ type Response struct {
 	Body          []byte
 
 	Block []byte
+}
+
+//dialler
+func DialWithDialer(uri string, timeout time.Duration, dial func(address string, d net.Dialer) (net.Conn, error)) (self *Client, err error) {
+	var URL *url.URL
+	if URL, err = url.Parse(uri); err != nil {
+		return
+	}
+
+	if _, _, err := net.SplitHostPort(URL.Host); err != nil {
+		URL.Host = URL.Host + ":554"
+	}
+	var conn net.Conn
+	dailer := net.Dialer{Timeout: timeout}
+
+	if conn, err = dial(URL.Host, dailer); err != nil {
+		return
+	}
+
+	u2 := *URL
+	u2.User = nil
+
+	connt := &connWithTimeout{Conn: conn}
+
+	self = &Client{
+		conn:            connt,
+		brconn:          bufio.NewReaderSize(connt, 256),
+		url:             URL,
+		requestUri:      u2.String(),
+		DebugRtp:        DebugRtp,
+		DebugRtsp:       DebugRtsp,
+		SkipErrRtpBlock: SkipErrRtpBlock,
+	}
+	return
 }
 
 func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
@@ -806,9 +840,7 @@ func (self *Stream) makeCodecData() (err error) {
 				return
 			}
 		default:
-			//log.Fatalln("Fix Format may be raw PCM 97", media.PayloadType, media.Type)
-			err = fmt.Errorf("rtsp: Type=%d unsupported", media.Type)
-			return
+			log.Fatalln("Fix Format may be raw PCM 97", media.PayloadType, media.Type)
 		}
 	} else {
 		switch media.PayloadType {

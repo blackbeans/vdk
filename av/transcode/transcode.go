@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/deepch/vdk/av"
-	"github.com/deepch/vdk/av/pktque"
+	"github.com/blackbeans/vdk/av"
+	"github.com/blackbeans/vdk/av/pktque"
 )
 
 var Debug bool

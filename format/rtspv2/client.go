@@ -8,21 +8,26 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/blackbeans/vdk/codec/rtph264"
+	"github.com/blackbeans/vdk/utils/bits/pio"
+	"github.com/pion/rtp"
 	"html"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/deepch/vdk/av"
-	"github.com/deepch/vdk/codec"
-	"github.com/deepch/vdk/codec/aacparser"
-	"github.com/deepch/vdk/codec/h264parser"
-	"github.com/deepch/vdk/codec/h265parser"
-	"github.com/deepch/vdk/format/rtsp/sdp"
+	"github.com/blackbeans/vdk/av"
+	"github.com/blackbeans/vdk/codec"
+	"github.com/blackbeans/vdk/codec/aacparser"
+	"github.com/blackbeans/vdk/codec/h264parser"
+	"github.com/blackbeans/vdk/codec/h265parser"
+	"github.com/blackbeans/vdk/format/rtsp/sdp"
+	"github.com/pion/rtcp"
 )
 
 const (
@@ -90,6 +95,7 @@ type RTSPClient struct {
 
 type RTSPClientOptions struct {
 	Debug            bool
+	RtpOverUdp       bool // udp 或者 tcp
 	URL              string
 	DialTimeout      time.Duration
 	ReadWriteTimeout time.Duration
@@ -126,26 +132,47 @@ func Dial(options RTSPClientOptions) (*RTSPClient, error) {
 	}
 	client.conn = conn
 	client.connRW = bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
-	err = client.request(OPTIONS, nil, client.pURL.String(), false, false)
+
+	err = client.request(OPTIONS, nil, client.pURL.String(), false, false, nil)
 	if err != nil {
 		return nil, err
 	}
-	err = client.request(DESCRIBE, map[string]string{"Accept": "application/sdp"}, client.pURL.String(), false, false)
+
+	err = client.request(DESCRIBE, map[string]string{"Accept": "application/sdp"}, client.pURL.String(), false, false, nil)
 	if err != nil {
 		return nil, err
 	}
 	var ch int
-	for _, i2 := range client.mediaSDP {
+	for idx, i2 := range client.mediaSDP {
 		if (i2.AVType != VIDEO && i2.AVType != AUDIO) || (client.options.DisableAudio && i2.AVType == AUDIO) {
 			continue
 		}
-		err = client.request(SETUP, map[string]string{"Transport": "RTP/AVP/TCP;unicast;interleaved=" + strconv.Itoa(ch) + "-" + strconv.Itoa(ch+1)}, client.ControlTrack(i2.Control), false, false)
+
+		//默认都用TCP传输
+		if !options.RtpOverUdp {
+			i2.MediaProtocol = "RTP/AVP/TCP"
+		}
+		transport := ""
+		//不是TCP传输就是UDP
+		if i2.MediaProtocol != "RTP/AVP/TCP" {
+			//偶数用于RTP报文   奇数用于RTCP
+			rtpPort := (rand.Intn((65535-10000)/2) * 2) + 10000
+			client.mediaSDP[idx].ClientPort = strconv.Itoa(rtpPort) + "-" + strconv.Itoa(rtpPort+1)
+			client.mediaSDP[idx].MediaProtocol = "RTP/AVP/UDP"
+			transport = i2.MediaProtocol +
+				";unicast;client_port=" + client.mediaSDP[idx].ClientPort
+		} else {
+			transport = i2.MediaProtocol + ";unicast;interleaved=" + strconv.Itoa(ch) + "-" + strconv.Itoa(ch+1)
+		}
+
+		err = client.request(SETUP, map[string]string{"Transport": transport},
+			client.ControlTrack(i2.Control), false, false, &client.mediaSDP[idx])
 		if err != nil {
 			return nil, err
 		}
 		if i2.AVType == VIDEO {
 			if i2.Type == av.H264 {
-				if len(i2.SpropParameterSets) > 1 {
+				if nil != i2.SpropParameterSets && len(i2.SpropParameterSets) > 1 {
 					if codecData, err := h264parser.NewCodecDataFromSPSAndPPS(i2.SpropParameterSets[0], i2.SpropParameterSets[1]); err == nil {
 						client.sps = i2.SpropParameterSets[0]
 						client.pps = i2.SpropParameterSets[1]
@@ -215,12 +242,144 @@ func Dial(options RTSPClientOptions) (*RTSPClient, error) {
 		ch += 2
 	}
 
-	err = client.request(PLAY, nil, client.control, false, false)
+	err = client.request(PLAY, nil, client.control, false, false, nil)
 	if err != nil {
 		return nil, err
 	}
-	go client.startStream()
+
+	for _, media := range client.mediaSDP {
+		if (media.AVType != VIDEO && media.AVType != AUDIO) || (client.options.DisableAudio && media.AVType == AUDIO) {
+			continue
+		}
+		//rtp协议走 UDP协议
+		if media.MediaProtocol == "RTP/AVP/UDP" {
+			ports := strings.Split(media.ServerPort, "-")
+			clientPorts := strings.Split(media.ClientPort, "-")
+			//启动UDP连接
+			splitRemoteHost, _, _ := net.SplitHostPort(client.pURL.Host)
+			localRTPAddr, _ := net.ResolveUDPAddr("udp", ":"+clientPorts[0])
+			remoteRTPAddr, _ := net.ResolveUDPAddr("udp", net.JoinHostPort(splitRemoteHost, ports[0]))
+			rtpConn, err := net.DialUDP("udp", localRTPAddr, remoteRTPAddr)
+			if nil != err {
+				return nil, err
+			}
+			localRTCPAddr, _ := net.ResolveUDPAddr("udp", ":"+clientPorts[1])
+			remoteRTCPAddr, _ := net.ResolveUDPAddr("udp", net.JoinHostPort(splitRemoteHost, ports[1]))
+			rtcpConn, err := net.DialUDP("udp", localRTCPAddr, remoteRTCPAddr)
+			if nil != err {
+				return nil, err
+			}
+
+			go client.startRTPStream(rtpConn)
+			go client.startRTCPStream(rtcpConn)
+		} else {
+			go client.startStream()
+		}
+	}
 	return client, nil
+}
+
+func (client *RTSPClient) startRTCPStream(udpConn *net.UDPConn) {
+	defer func() {
+		client.Signals <- SignalStreamRTPStop
+		udpConn.Close()
+	}()
+	rtcpBuff := make([]byte, 1024)
+
+	for {
+		err := udpConn.SetDeadline(time.Now().Add(client.options.ReadWriteTimeout))
+		if err != nil {
+			client.Println("RTSP Client RTP SetDeadline", err)
+			return
+		}
+
+		l, _, err := udpConn.ReadFromUDP(rtcpBuff)
+		if err != nil && l < RTPHeaderSize {
+			client.Println("RTSP Client RTP ReadFromUDP", err)
+			return
+		}
+		//解析rtcp
+		_, err = rtcp.Unmarshal(rtcpBuff[:l])
+		if nil != err {
+			client.Println("RTSP Client RTCP Unmarshal", err)
+			return
+		}
+
+	}
+}
+
+func (client *RTSPClient) startRTPStream(udpConn *net.UDPConn) {
+	defer func() {
+		client.Signals <- SignalStreamRTPStop
+		udpConn.Close()
+	}()
+
+	decoder := rtph264.NewDecoder(udpConn)
+	timer := time.Now()
+	for {
+		err := udpConn.SetDeadline(time.Now().Add(client.options.ReadWriteTimeout))
+		if err != nil {
+			client.Println("RTSP Client RTP SetDeadline", err)
+			return
+		}
+		if int(time.Now().Sub(timer).Seconds()) > 25 {
+			err := client.request(OPTIONS, map[string]string{"Require": "implicit-play"}, client.control, false, true, nil)
+			if err != nil {
+				client.Println("RTSP Client RTP keep-alive", err)
+				return
+			}
+			timer = time.Now()
+		}
+
+		//h264报文
+		header, nalus, err := decoder.Read()
+		if nil != err {
+			client.Println("RTSP Client Read " + err.Error())
+			return
+		}
+
+		for _, nalu := range nalus {
+			if len(client.OutgoingPacketQueue) > 2000 {
+				client.Println("RTSP Client OutgoingPacket Chanel Full")
+				return
+			}
+			naluType := nalu[0] & 0x1f
+			pkt := &av.Packet{
+				Idx:  client.videoIDX,
+				Time: time.Duration(header.Timestamp) * time.Second / time.Duration(client.mediaSDP[client.videoIDX].TimeScale),
+			}
+
+			// 拼接数据包
+			var buf bytes.Buffer
+			switch naluType {
+			case 1, 2, 3, 4, 5:
+				if naluType == 5 {
+					pkt.IsKeyFrame = true
+				}
+				b := make([]byte, 4)
+				pio.PutU32BE(b[0:4], uint32(len(nalu)))
+				buf.Write(b)
+				buf.Write(nalu)
+			case h264parser.NALU_SPS:
+				//pps
+				if len(client.sps) <= 0 || bytes.Compare(client.sps, nalu) != 0 {
+					client.sps = nalu
+					client.CodecUpdateSPS(nalu)
+				}
+				buf.Write(nalu)
+			case h264parser.NALU_PPS:
+				//pps
+				if len(client.pps) <= 0 || bytes.Compare(client.pps, nalu) != 0 {
+					client.pps = nalu
+					client.CodecUpdatePPS(nalu)
+				}
+				buf.Write(nalu)
+			}
+			pkt.Data = buf.Bytes()
+			client.OutgoingPacketQueue <- pkt
+		}
+
+	}
 }
 
 func (client *RTSPClient) ControlTrack(track string) string {
@@ -232,6 +391,8 @@ func (client *RTSPClient) ControlTrack(track string) string {
 	}
 	return client.control + track
 }
+
+//var  f , _ = os.OpenFile("./a.h264",os.O_CREATE | os.O_APPEND | os.O_RDWR,os.ModePerm)
 
 func (client *RTSPClient) startStream() {
 	defer func() {
@@ -248,7 +409,7 @@ func (client *RTSPClient) startStream() {
 			return
 		}
 		if int(time.Now().Sub(timer).Seconds()) > 25 {
-			err := client.request(OPTIONS, map[string]string{"Require": "implicit-play"}, client.control, false, true)
+			err := client.request(OPTIONS, map[string]string{"Require": "implicit-play"}, client.control, false, true, nil)
 			if err != nil {
 				client.Println("RTSP Client RTP keep-alive", err)
 				return
@@ -271,8 +432,11 @@ func (client *RTSPClient) startStream() {
 				return
 			}
 			content := make([]byte, length+4)
+			//类型
 			content[0] = header[0]
+			//chid
 			content[1] = header[1]
+			//长度
 			content[2] = header[2]
 			content[3] = header[3]
 			n, rerr := io.ReadFull(client.connRW, content[4:length+4])
@@ -293,12 +457,12 @@ func (client *RTSPClient) startStream() {
 			if !got {
 				continue
 			}
-			for _, i2 := range pkt {
-				if len(client.OutgoingPacketQueue) > 2000 {
-					client.Println("RTSP Client OutgoingPacket Chanel Full")
-					return
-				}
-				client.OutgoingPacketQueue <- i2
+			for i := range pkt {
+				//if len(client.OutgoingPacketQueue) > 2000 {
+				//	client.Println("RTSP Client OutgoingPacket Chanel Full")
+				//	return
+				//}
+				client.OutgoingPacketQueue <- pkt[i]
 			}
 		case 0x52:
 			var responseTmp []byte
@@ -333,7 +497,7 @@ func (client *RTSPClient) startStream() {
 	}
 }
 
-func (client *RTSPClient) request(method string, customHeaders map[string]string, uri string, one bool, nores bool) (err error) {
+func (client *RTSPClient) request(method string, customHeaders map[string]string, uri string, one bool, nores bool, media *sdp.Media) (err error) {
 	err = client.conn.SetDeadline(time.Now().Add(client.options.ReadWriteTimeout))
 	if err != nil {
 		return
@@ -405,7 +569,7 @@ func (client *RTSPClient) request(method string, customHeaders map[string]string
 				client.clientBasic = true
 			}
 			if !one {
-				err = client.request(method, customHeaders, uri, true, false)
+				err = client.request(method, customHeaders, uri, true, false, nil)
 				return
 			}
 			err = errors.New("RTSP Client Unauthorized 401")
@@ -439,6 +603,7 @@ func (client *RTSPClient) request(method string, customHeaders map[string]string
 				}
 			}
 		}
+
 		if method == DESCRIBE {
 			if val, ok := res["Content-Length"]; ok {
 				contentLen, err = strconv.Atoi(strings.TrimSpace(val))
@@ -454,6 +619,25 @@ func (client *RTSPClient) request(method string, customHeaders map[string]string
 				_, client.mediaSDP = sdp.Parse(string(client.SDPRaw))
 			}
 		}
+
+		//setup阶段获取transport
+		if method == SETUP {
+			//获取transport
+			if trans, ok := res["Transport"]; ok {
+				splits := strings.Split(trans, ";")
+				for _, item := range splits {
+					if strings.Contains(item, "=") {
+						kv := strings.SplitN(item, "=", 2)
+						if "server_port" == kv[0] {
+							if nil != media {
+								//获取到端口
+								media.ServerPort = kv[1]
+							}
+						}
+					}
+				}
+			}
+		}
 		client.Println(builder.String())
 	}
 	return
@@ -462,7 +646,7 @@ func (client *RTSPClient) request(method string, customHeaders map[string]string
 func (client *RTSPClient) Close() {
 	if client.conn != nil {
 		client.conn.SetDeadline(time.Now().Add(time.Second))
-		client.request(TEARDOWN, nil, client.control, false, true)
+		client.request(TEARDOWN, nil, client.control, false, true, nil)
 		err := client.conn.Close()
 		client.Println("RTSP Client Close", err)
 	}
@@ -542,6 +726,13 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		}
 	}
 	offset += 4
+
+	rtpPacket := rtp.Packet{}
+	err := rtpPacket.Unmarshal(content[4:])
+	if nil != err {
+		client.Println("drop packet.Unmarshal", err)
+		return nil, false
+	}
 	switch int(content[1]) {
 	case client.videoID:
 		if client.PreVideoTS == 0 {
@@ -556,6 +747,9 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 			client.BufferRtpPacket.Truncate(0)
 			client.BufferRtpPacket.Reset()
 		}
+
+		//payloader:= codecs.H264Payloader{}
+		//nalRaw := payloader.Payload(1500,rtpPacket.Payload)
 		nalRaw, _ := h264parser.SplitNALUs(content[offset:end])
 		if len(nalRaw) == 0 || len(nalRaw[0]) == 0 {
 			return nil, false
@@ -620,12 +814,13 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 						Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
 						Time:            time.Duration(timestamp/90) * time.Millisecond,
 					})
+
 				case naluType == 7:
 					client.CodecUpdateSPS(nal)
 				case naluType == 8:
 					client.CodecUpdatePPS(nal)
 				case naluType == 24:
-					client.Println("24 Type need add next version report https://github.com/deepch/vdk")
+					client.Println("24 Type need add next version report https://github.com/blackbeans/vdk")
 				case naluType == 28:
 					fuIndicator := content[offset]
 					fuHeader := content[offset+1]

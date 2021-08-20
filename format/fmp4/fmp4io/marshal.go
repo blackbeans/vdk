@@ -4,7 +4,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/deepch/vdk/utils/bits/pio"
+	"github.com/blackbeans/vdk/utils/bits/pio"
 )
 
 func GetTime32(b []byte) (t time.Time) {

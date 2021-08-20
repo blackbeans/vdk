@@ -14,11 +14,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/deepch/vdk/av"
-	"github.com/deepch/vdk/av/avutil"
-	"github.com/deepch/vdk/format/flv"
-	"github.com/deepch/vdk/format/flv/flvio"
-	"github.com/deepch/vdk/utils/bits/pio"
+	"github.com/blackbeans/vdk/av"
+	"github.com/blackbeans/vdk/av/avutil"
+	"github.com/blackbeans/vdk/format/flv"
+	"github.com/blackbeans/vdk/format/flv/flvio"
+	"github.com/blackbeans/vdk/utils/bits/pio"
 )
 
 var Debug bool
