@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"github.com/blackbeans/vdk/codec/rtph264"
 	"github.com/blackbeans/vdk/utils/bits/pio"
-	"github.com/pion/rtp"
 	"html"
 	"io"
 	"log"
@@ -78,19 +77,20 @@ type RTSPClient struct {
 	clientBasic         bool
 	fuStarted           bool
 	options             RTSPClientOptions
-	BufferRtpPacket     *bytes.Buffer
-	vps                 []byte
-	sps                 []byte
-	pps                 []byte
-	CodecData           []av.CodecData
-	AudioTimeLine       time.Duration
-	AudioTimeScale      int64
-	audioCodec          av.CodecType
-	videoCodec          av.CodecType
-	PreAudioTS          int64
-	PreVideoTS          int64
-	PreSequenceNumber   int
-	FPS                 int
+	//缓存RTP包数据FU-A分片包的中间数据
+	BufferRtpPacket   *bytes.Buffer
+	vps               []byte
+	sps               []byte
+	pps               []byte
+	CodecData         []av.CodecData
+	AudioTimeLine     time.Duration
+	AudioTimeScale    int64
+	audioCodec        av.CodecType
+	videoCodec        av.CodecType
+	PreAudioTS        int64
+	PreVideoTS        int64
+	PreSequenceNumber int
+	FPS               int
 }
 
 type RTSPClientOptions struct {
@@ -179,7 +179,7 @@ func Dial(options RTSPClientOptions) (*RTSPClient, error) {
 						client.CodecData = append(client.CodecData, codecData)
 					}
 				} else {
-					client.CodecData = append(client.CodecData, h264parser.CodecData{})
+					//client.CodecData = append(client.CodecData, h264parser.CodecData{})
 				}
 				client.FPS = i2.FPS
 				client.videoCodec = av.H264
@@ -392,7 +392,7 @@ func (client *RTSPClient) ControlTrack(track string) string {
 	return client.control + track
 }
 
-//var  f , _ = os.OpenFile("./a.h264",os.O_CREATE | os.O_APPEND | os.O_RDWR,os.ModePerm)
+//var f, _ = os.OpenFile("./a.h264", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.ModePerm)
 
 func (client *RTSPClient) startStream() {
 	defer func() {
@@ -444,6 +444,7 @@ func (client *RTSPClient) startStream() {
 				client.Println("RTSP Client RTP ReadFull", err)
 				return
 			}
+
 			//atomic.AddInt64(&client.Bitrate, int64(length+4))
 			if client.options.OutgoingProxy {
 				if len(client.OutgoingProxyQueue) < 2000 {
@@ -458,10 +459,6 @@ func (client *RTSPClient) startStream() {
 				continue
 			}
 			for i := range pkt {
-				//if len(client.OutgoingPacketQueue) > 2000 {
-				//	client.Println("RTSP Client OutgoingPacket Chanel Full")
-				//	return
-				//}
 				client.OutgoingPacketQueue <- pkt[i]
 			}
 		case 0x52:
@@ -726,13 +723,6 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		}
 	}
 	offset += 4
-
-	rtpPacket := rtp.Packet{}
-	err := rtpPacket.Unmarshal(content[4:])
-	if nil != err {
-		client.Println("drop packet.Unmarshal", err)
-		return nil, false
-	}
 	switch int(content[1]) {
 	case client.videoID:
 		if client.PreVideoTS == 0 {
@@ -748,126 +738,92 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 			client.BufferRtpPacket.Reset()
 		}
 
-		//payloader:= codecs.H264Payloader{}
-		//nalRaw := payloader.Payload(1500,rtpPacket.Payload)
-		nalRaw, _ := h264parser.SplitNALUs(content[offset:end])
-		if len(nalRaw) == 0 || len(nalRaw[0]) == 0 {
+		if client.videoCodec != av.H264 {
+			client.Println("Unsupport Not H264 Format")
 			return nil, false
 		}
+
+		rtpPayload := content[offset:end]
+		//FU-A分片类型
+		fuIndicator := content[offset]
+		fuHeader := content[offset+1]
+		naluType := fuIndicator & 0x1f //获取FU indicator的类型域
+		//获取FU header的前三位，判断当前是分包的开始、中间或结束
+		flag := fuIndicator & 0xe0
+		//nal Fua
+		nalFua := flag | (fuHeader & 0x1f)
+
 		var retmap []*av.Packet
-		for _, nal := range nalRaw {
-			if client.videoCodec == av.H265 {
-				naluType := (nal[0] >> 1) & 0x3f
-				switch naluType {
-				case h265parser.NAL_UNIT_CODED_SLICE_TRAIL_R:
-					retmap = append(retmap, &av.Packet{
-						Data:            append(binSize(len(nal)), nal...),
-						CompositionTime: time.Duration(1) * time.Millisecond,
-						Idx:             client.videoIDX,
-						IsKeyFrame:      false,
-						Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
-						Time:            time.Duration(timestamp/90) * time.Millisecond,
-					})
-				case h265parser.NAL_UNIT_VPS:
-					client.CodecUpdateVPS(nal)
-				case h265parser.NAL_UNIT_SPS:
-					client.CodecUpdateSPS(nal)
-				case h265parser.NAL_UNIT_PPS:
-					client.CodecUpdatePPS(nal)
-				case h265parser.NAL_UNIT_UNSPECIFIED_49:
-					se := nal[2] >> 6
-					naluType := nal[2] & 0x3f
-					if se == 2 {
-						client.BufferRtpPacket.Truncate(0)
-						client.BufferRtpPacket.Reset()
-						client.BufferRtpPacket.Write([]byte{(nal[0] & 0x81) | (naluType << 1), nal[1]})
-						r := make([]byte, 2)
-						r[1] = nal[1]
-						r[0] = (nal[0] & 0x81) | (naluType << 1)
-						client.BufferRtpPacket.Write(nal[3:])
-					} else if se == 1 {
-						client.BufferRtpPacket.Write(nal[3:])
-						retmap = append(retmap, &av.Packet{
-							Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
-							CompositionTime: time.Duration(1) * time.Millisecond,
-							Idx:             client.videoIDX,
-							IsKeyFrame:      naluType == h265parser.NAL_UNIT_CODED_SLICE_IDR_W_RADL,
-							Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
-							Time:            time.Duration(timestamp/90) * time.Millisecond,
-						})
-					} else {
-						client.BufferRtpPacket.Write(nal[3:])
-					}
-				default:
-					client.Println("Unsupported Nal", naluType)
-				}
+		switch {
+		//单一分片的NALU
+		case naluType >= 1 && naluType <= 5:
+			//f.Write(append([]byte{0x00,0x00,0x01},rtpPayload...))
+			retmap = append(retmap, &av.Packet{
+				Data:            append(binSize(len(rtpPayload)), rtpPayload...),
+				CompositionTime: time.Duration(1) * time.Millisecond,
+				Idx:             client.videoIDX,
+				IsKeyFrame:      naluType == 5,
+				Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
+				Time:            time.Duration(timestamp/90) * time.Millisecond,
+			})
 
-			} else if client.videoCodec == av.H264 {
-				naluType := nal[0] & 0x1f
-				switch {
-				case naluType >= 1 && naluType <= 5:
-					retmap = append(retmap, &av.Packet{
-						Data:            append(binSize(len(nal)), nal...),
-						CompositionTime: time.Duration(1) * time.Millisecond,
-						Idx:             client.videoIDX,
-						IsKeyFrame:      naluType == 5,
-						Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
-						Time:            time.Duration(timestamp/90) * time.Millisecond,
-					})
-
-				case naluType == 7:
-					client.CodecUpdateSPS(nal)
-				case naluType == 8:
-					client.CodecUpdatePPS(nal)
-				case naluType == 24:
-					client.Println("24 Type need add next version report https://github.com/blackbeans/vdk")
-				case naluType == 28:
-					fuIndicator := content[offset]
-					fuHeader := content[offset+1]
-					isStart := fuHeader&0x80 != 0
-					isEnd := fuHeader&0x40 != 0
-					if isStart {
-						client.fuStarted = true
-						client.BufferRtpPacket.Truncate(0)
-						client.BufferRtpPacket.Reset()
-						client.BufferRtpPacket.Write([]byte{fuIndicator&0xe0 | fuHeader&0x1f})
-					}
-					if client.fuStarted {
-						client.BufferRtpPacket.Write(content[offset+2 : end])
-						if isEnd {
-							client.fuStarted = false
-							naluTypef := client.BufferRtpPacket.Bytes()[0] & 0x1f
-							if naluTypef == 7 || naluTypef == 9 {
-								bufered, _ := h264parser.SplitNALUs(append([]byte{0, 0, 0, 1}, client.BufferRtpPacket.Bytes()...))
-								for _, v := range bufered {
-									naluTypefs := v[0] & 0x1f
-									switch {
-									case naluTypefs == 5:
-										client.BufferRtpPacket.Reset()
-										client.BufferRtpPacket.Write(v)
-										naluTypef = 5
-									case naluTypefs == 7:
-										client.CodecUpdateSPS(v)
-									case naluTypefs == 8:
-										client.CodecUpdatePPS(v)
-									}
-								}
+		case naluType == 7:
+			client.CodecUpdateSPS(rtpPayload)
+		case naluType == 8:
+			client.CodecUpdatePPS(rtpPayload)
+		case naluType == 24:
+			client.Println("24 Type need add next version report https://github.com/blackbeans/vdk")
+		case naluType == 0x1c:
+			//FU-A分片类型
+			//FU-A的起始
+			isStart := fuHeader&0x80 != 0
+			//FU-A的结尾
+			isEnd := fuHeader&0x40 != 0
+			if isStart {
+				client.fuStarted = true
+				client.BufferRtpPacket.Truncate(0)
+				client.BufferRtpPacket.Reset()
+				client.BufferRtpPacket.Write([]byte{nalFua})
+			}
+			if client.fuStarted {
+				client.BufferRtpPacket.Write(content[offset+2 : end])
+				if isEnd {
+					//中间或者是结束的包那么写入
+					client.fuStarted = false
+					naluTypef := client.BufferRtpPacket.Bytes()[0] & 0x1f
+					if naluTypef == 7 || naluTypef == 9 {
+						bufered, _ := h264parser.SplitNALUs(append([]byte{0x00, 0x00, 0x00, 0x01}, client.BufferRtpPacket.Bytes()...))
+						for _, v := range bufered {
+							naluTypefs := v[0] & 0x1f
+							switch {
+							case naluTypefs == 5:
+								client.BufferRtpPacket.Reset()
+								client.BufferRtpPacket.Write(v)
+								naluTypef = 5
+							case naluTypefs == 7:
+								client.CodecUpdateSPS(v)
+							case naluTypefs == 8:
+								client.CodecUpdatePPS(v)
 							}
-							retmap = append(retmap, &av.Packet{
-								Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
-								CompositionTime: time.Duration(1) * time.Millisecond,
-								Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
-								Idx:             client.videoIDX,
-								IsKeyFrame:      naluTypef == 5,
-								Time:            time.Duration(timestamp/90) * time.Millisecond,
-							})
 						}
 					}
-				default:
-					client.Println("Unsupported NAL Type", naluType)
+
+					//写到文件里
+					//f.Write(append([]byte{0x00, 0x00, 0x01}, client.BufferRtpPacket.Bytes()...))
+					retmap = append(retmap, &av.Packet{
+						Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
+						CompositionTime: time.Duration(1) * time.Millisecond,
+						Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
+						Idx:             client.videoIDX,
+						IsKeyFrame:      naluTypef == 5,
+						Time:            time.Duration(timestamp/90) * time.Millisecond,
+					})
 				}
 			}
+		default:
+			client.Println("Unsupported NAL Type", naluType)
 		}
+
 		if len(retmap) > 0 {
 			client.PreVideoTS = timestamp
 			return retmap, true
