@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"github.com/blackbeans/vdk/codec/rtph264"
 	"github.com/blackbeans/vdk/utils/bits/pio"
+	"github.com/pion/rtp"
 	"html"
 	"io"
 	"log"
@@ -388,8 +389,6 @@ func (client *RTSPClient) ControlTrack(track string) string {
 	return client.control + track
 }
 
-//var f, _ = os.OpenFile("./a.h264", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.ModePerm)
-
 func (client *RTSPClient) startStream() {
 	defer func() {
 		client.Signals <- SignalStreamRTPStop
@@ -688,46 +687,55 @@ func stringInBetween(str string, start string, end string) (result string) {
 	return str
 }
 
+//var f, _ = os.OpenFile("./a.h264", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.ModePerm)
 func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 	content := *payloadRAW
-	firstByte := content[4]
-	padding := (firstByte>>5)&1 == 1
-	extension := (firstByte>>4)&1 == 1
-	CSRCCnt := int(firstByte & 0x0f)
-	SequenceNumber := int(binary.BigEndian.Uint16(content[6:8]))
-	timestamp := int64(binary.BigEndian.Uint32(content[8:12]))
-	offset := RTPHeaderSize
+	//firstByte := content[4]
+	//padding := (firstByte>>5)&1 == 1
+	//extension := (firstByte>>4)&1 == 1
+	//CSRCCnt := int(firstByte & 0x0f)
+	//SequenceNumber := int(binary.BigEndian.Uint16(content[6:8]))
+	//timestamp := int64(binary.BigEndian.Uint32(content[8:12]))
+	//offset := RTPHeaderSize
+	//
+	//end := len(content)
+	//if end-offset >= 4*CSRCCnt {
+	//	offset += 4 * CSRCCnt
+	//}
+	//if extension && len(content) < 4+offset+2+2 {
+	//	return nil, false
+	//}
+	//if extension && end-offset >= 4 {
+	//	extLen := 4 * int(binary.BigEndian.Uint16(content[4+offset+2:]))
+	//	offset += 4
+	//	if end-offset >= extLen {
+	//		offset += extLen
+	//	}
+	//}
+	//if padding && end-offset > 0 {pay
+	//	paddingLen := int(content[end-1])
+	//	if end-offset >= paddingLen {
+	//		end -= paddingLen
+	//	}
+	//}
 
-	end := len(content)
-	if end-offset >= 4*CSRCCnt {
-		offset += 4 * CSRCCnt
-	}
-	if extension && len(content) < 4+offset+2+2 {
+	rtpPacket := rtp.Packet{}
+	err := rtpPacket.Unmarshal(content[4:])
+	if nil != err {
+		client.Println("rtp Unmarshal ", err)
 		return nil, false
 	}
-	if extension && end-offset >= 4 {
-		extLen := 4 * int(binary.BigEndian.Uint16(content[4+offset+2:]))
-		offset += 4
-		if end-offset >= extLen {
-			offset += extLen
-		}
-	}
-	if padding && end-offset > 0 {
-		paddingLen := int(content[end-1])
-		if end-offset >= paddingLen {
-			end -= paddingLen
-		}
-	}
-	offset += 4
+
+	//offset += 4
 	switch int(content[1]) {
 	case client.videoID:
 		if client.PreVideoTS == 0 {
-			client.PreVideoTS = timestamp
+			client.PreVideoTS = int64(rtpPacket.Timestamp)
 		}
-		if client.PreSequenceNumber != 0 && SequenceNumber-client.PreSequenceNumber != 1 {
-			client.Println("drop packet", SequenceNumber-1)
+		if client.PreSequenceNumber != 0 && int(rtpPacket.SequenceNumber)-client.PreSequenceNumber != 1 {
+			client.Println("drop packet", rtpPacket.SequenceNumber-1)
 		}
-		client.PreSequenceNumber = SequenceNumber
+		client.PreSequenceNumber = int(rtpPacket.SequenceNumber)
 		if client.BufferRtpPacket.Len() > 4048576 {
 			client.Println("Big Buffer Flush")
 			client.BufferRtpPacket.Truncate(0)
@@ -739,10 +747,10 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 			return nil, false
 		}
 
-		rtpPayload := content[offset:end]
+		rtpPayload := rtpPacket.Payload
 		//FU-A分片类型
-		fuIndicator := content[offset]
-		fuHeader := content[offset+1]
+		fuIndicator := rtpPayload[0]
+		fuHeader := rtpPayload[1]
 		naluType := fuIndicator & 0x1f //获取FU indicator的类型域
 		//获取FU header的前三位，判断当前是分包的开始、中间或结束
 		flag := fuIndicator & 0xe0
@@ -759,8 +767,8 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 				CompositionTime: time.Duration(1) * time.Millisecond,
 				Idx:             client.videoIDX,
 				IsKeyFrame:      naluType == 5,
-				Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
-				Time:            time.Duration(timestamp/90) * time.Millisecond,
+				Duration:        time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond,
+				Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
 			})
 
 		case naluType == 7:
@@ -782,7 +790,7 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 				client.BufferRtpPacket.Write([]byte{nalFua})
 			}
 			if client.fuStarted {
-				client.BufferRtpPacket.Write(content[offset+2 : end])
+				client.BufferRtpPacket.Write(rtpPayload[2:])
 				if isEnd {
 					//中间或者是结束的包那么写入
 					client.fuStarted = false
@@ -793,8 +801,8 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 							naluTypefs := v[0] & 0x1f
 							switch {
 							case naluTypefs == 5:
-								client.BufferRtpPacket.Reset()
-								client.BufferRtpPacket.Write(v)
+								//client.BufferRtpPacket.Reset()
+								//client.BufferRtpPacket.Write(v)
 								naluTypef = 5
 							case naluTypefs == 7:
 								client.CodecUpdateSPS(v)
@@ -809,10 +817,10 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 					retmap = append(retmap, &av.Packet{
 						Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
 						CompositionTime: time.Duration(1) * time.Millisecond,
-						Duration:        time.Duration(float32(timestamp-client.PreVideoTS)/90) * time.Millisecond,
+						Duration:        time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond,
 						Idx:             client.videoIDX,
 						IsKeyFrame:      naluTypef == 5,
-						Time:            time.Duration(timestamp/90) * time.Millisecond,
+						Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
 					})
 				}
 			}
@@ -821,14 +829,14 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		}
 
 		if len(retmap) > 0 {
-			client.PreVideoTS = timestamp
+			client.PreVideoTS = int64(rtpPacket.Timestamp)
 			return retmap, true
 		}
 	case client.audioID:
 		if client.PreAudioTS == 0 {
-			client.PreAudioTS = timestamp
+			client.PreAudioTS = int64(rtpPacket.Timestamp)
 		}
-		nalRaw, _ := h264parser.SplitNALUs(content[offset:end])
+		nalRaw, _ := h264parser.SplitNALUs(rtpPacket.Payload)
 		var retmap []*av.Packet
 		for _, nal := range nalRaw {
 			var duration time.Duration
@@ -895,7 +903,7 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 			}
 		}
 		if len(retmap) > 0 {
-			client.PreAudioTS = timestamp
+			client.PreAudioTS = int64(rtpPacket.Timestamp)
 			return retmap, true
 		}
 	default:
