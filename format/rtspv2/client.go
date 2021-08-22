@@ -339,10 +339,6 @@ func (client *RTSPClient) startRTPStream(udpConn *net.UDPConn) {
 		}
 
 		for _, nalu := range nalus {
-			if len(client.OutgoingPacketQueue) > 2000 {
-				client.Println("RTSP Client OutgoingPacket Chanel Full")
-				return
-			}
 			naluType := nalu[0] & 0x1f
 			pkt := &av.Packet{
 				Idx:  client.videoIDX,
