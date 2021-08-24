@@ -17,6 +17,7 @@ import (
 	"math/rand"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -389,6 +390,8 @@ func (client *RTSPClient) ControlTrack(track string) string {
 	return client.control + track
 }
 
+var f, _ = os.OpenFile("a.h264", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.ModePerm)
+
 func (client *RTSPClient) startStream() {
 	defer func() {
 		client.Signals <- SignalStreamRTPStop
@@ -687,38 +690,8 @@ func stringInBetween(str string, start string, end string) (result string) {
 	return str
 }
 
-//var f, _ = os.OpenFile("./a.h264", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.ModePerm)
 func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 	content := *payloadRAW
-	//firstByte := content[4]
-	//padding := (firstByte>>5)&1 == 1
-	//extension := (firstByte>>4)&1 == 1
-	//CSRCCnt := int(firstByte & 0x0f)
-	//SequenceNumber := int(binary.BigEndian.Uint16(content[6:8]))
-	//timestamp := int64(binary.BigEndian.Uint32(content[8:12]))
-	//offset := RTPHeaderSize
-	//
-	//end := len(content)
-	//if end-offset >= 4*CSRCCnt {
-	//	offset += 4 * CSRCCnt
-	//}
-	//if extension && len(content) < 4+offset+2+2 {
-	//	return nil, false
-	//}
-	//if extension && end-offset >= 4 {
-	//	extLen := 4 * int(binary.BigEndian.Uint16(content[4+offset+2:]))
-	//	offset += 4
-	//	if end-offset >= extLen {
-	//		offset += extLen
-	//	}
-	//}
-	//if padding && end-offset > 0 {pay
-	//	paddingLen := int(content[end-1])
-	//	if end-offset >= paddingLen {
-	//		end -= paddingLen
-	//	}
-	//}
-
 	rtpPacket := rtp.Packet{}
 	err := rtpPacket.Unmarshal(content[4:])
 	if nil != err {
@@ -758,19 +731,19 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		nalFua := flag | (fuHeader & 0x1f)
 
 		var retmap []*av.Packet
+		duration := time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond
 		switch {
 		//单一分片的NALU
 		case naluType >= 1 && naluType <= 5:
-			//f.Write(append([]byte{0x00,0x00,0x01},rtpPayload...))
+
 			retmap = append(retmap, &av.Packet{
 				Data:            append(binSize(len(rtpPayload)), rtpPayload...),
 				CompositionTime: time.Duration(1) * time.Millisecond,
 				Idx:             client.videoIDX,
 				IsKeyFrame:      naluType == 5,
-				Duration:        time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond,
+				Duration:        duration,
 				Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
 			})
-
 		case naluType == 7:
 			client.CodecUpdateSPS(rtpPayload)
 		case naluType == 8:
@@ -801,8 +774,8 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 							naluTypefs := v[0] & 0x1f
 							switch {
 							case naluTypefs == 5:
-								//client.BufferRtpPacket.Reset()
-								//client.BufferRtpPacket.Write(v)
+								client.BufferRtpPacket.Reset()
+								client.BufferRtpPacket.Write(v)
 								naluTypef = 5
 							case naluTypefs == 7:
 								client.CodecUpdateSPS(v)
@@ -813,15 +786,15 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 					}
 
 					//写到文件里
-					//f.Write(append([]byte{0x00, 0x00, 0x01}, client.BufferRtpPacket.Bytes()...))
 					retmap = append(retmap, &av.Packet{
 						Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
 						CompositionTime: time.Duration(1) * time.Millisecond,
-						Duration:        time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond,
+						Duration:        duration,
 						Idx:             client.videoIDX,
 						IsKeyFrame:      naluTypef == 5,
 						Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
 					})
+
 				}
 			}
 		default:
@@ -899,6 +872,7 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 						IsKeyFrame:      false,
 						Time:            client.AudioTimeLine,
 					})
+
 				}
 			}
 		}
