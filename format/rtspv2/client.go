@@ -359,19 +359,11 @@ func (client *RTSPClient) startRTPStream(udpConn *net.UDPConn) {
 				buf.Write(b)
 				buf.Write(nalu)
 			case h264parser.NALU_SPS:
-				//pps
-				if len(client.sps) <= 0 || bytes.Compare(client.sps, nalu) != 0 {
-					client.sps = nalu
-					client.CodecUpdateSPS(nalu)
-				}
-				buf.Write(nalu)
+				client.CodecUpdateSPS(nalu)
+				continue
 			case h264parser.NALU_PPS:
-				//pps
-				if len(client.pps) <= 0 || bytes.Compare(client.pps, nalu) != 0 {
-					client.pps = nalu
-					client.CodecUpdatePPS(nalu)
-				}
-				buf.Write(nalu)
+				client.CodecUpdatePPS(nalu)
+				continue
 			}
 			pkt.Data = buf.Bytes()
 			client.OutgoingPacketQueue <- pkt
@@ -389,8 +381,6 @@ func (client *RTSPClient) ControlTrack(track string) string {
 	}
 	return client.control + track
 }
-
-var f, _ = os.OpenFile("a.h264", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.ModePerm)
 
 func (client *RTSPClient) startStream() {
 	defer func() {
