@@ -735,15 +735,30 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		switch {
 		//单一分片的NALU
 		case naluType >= 1 && naluType <= 5:
-
-			retmap = append(retmap, &av.Packet{
-				Data:            append(binSize(len(rtpPayload)), rtpPayload...),
-				CompositionTime: time.Duration(1) * time.Millisecond,
-				Idx:             client.videoIDX,
-				IsKeyFrame:      naluType == 5,
-				Duration:        duration,
-				Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
-			})
+			//前一个分片时间是0 或者 duration是0那么就是同一个包切分的不同slice
+			if duration <= 0 {
+				if client.BufferRtpPacket.Len() <= 0 {
+					client.BufferRtpPacket.Write(rtpPayload)
+				} else {
+					client.BufferRtpPacket.Write(append([]byte{0x00, 0x00, 0x01}, rtpPayload...))
+				}
+			} else if client.BufferRtpPacket.Len() > 0 {
+				//不一样的数据
+				pkt := &av.Packet{
+					CompositionTime: time.Duration(1) * time.Millisecond,
+					Idx:             client.videoIDX,
+					Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
+					//取第一个字节是否为关键帧
+					IsKeyFrame: client.BufferRtpPacket.Bytes()[0]&0x1f == 5,
+					Duration:   duration,
+					Time:       time.Duration(client.PreVideoTS/90) * time.Millisecond,
+				}
+				retmap = append(retmap, pkt)
+				//清空
+				client.BufferRtpPacket.Truncate(0)
+				client.BufferRtpPacket.Reset()
+				client.BufferRtpPacket.Write(rtpPayload)
+			}
 		case naluType == 7:
 			client.CodecUpdateSPS(rtpPayload)
 		case naluType == 8:
@@ -751,12 +766,27 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		case naluType == 24:
 			client.Println("24 Type need add next version report https://github.com/blackbeans/vdk")
 		case naluType == 0x1c:
-			//FU-A分片类型
-			//FU-A的起始
+
+			// paylay 第三个字节 最高位 0 继续组包， 如果是1组装之前的帧，1后的继续组包。
+			//帧分片开始
 			isStart := fuHeader&0x80 != 0
-			//FU-A的结尾
+			//帧分片结束
 			isEnd := fuHeader&0x40 != 0
 			if isStart {
+				if client.BufferRtpPacket.Len() > 0 {
+					//不一样的数据
+					pkt := &av.Packet{
+						CompositionTime: time.Duration(1) * time.Millisecond,
+						Idx:             client.videoIDX,
+						Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
+						//取第一个字节是否为关键帧
+						IsKeyFrame: client.BufferRtpPacket.Bytes()[0]&0x1f == 5,
+						Duration:   duration,
+						Time:       time.Duration(client.PreVideoTS/90) * time.Millisecond,
+					}
+					retmap = append(retmap, pkt)
+				}
+
 				client.fuStarted = true
 				client.BufferRtpPacket.Truncate(0)
 				client.BufferRtpPacket.Reset()
@@ -786,15 +816,18 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 					}
 
 					//写到文件里
-					retmap = append(retmap, &av.Packet{
+					pkt := &av.Packet{
 						Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
 						CompositionTime: time.Duration(1) * time.Millisecond,
 						Duration:        duration,
 						Idx:             client.videoIDX,
 						IsKeyFrame:      naluTypef == 5,
 						Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
-					})
+					}
 
+					retmap = append(retmap, pkt)
+					client.BufferRtpPacket.Truncate(0)
+					client.BufferRtpPacket.Reset()
 				}
 			}
 		default:
