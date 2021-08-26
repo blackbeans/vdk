@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/blackbeans/vdk/codec/rtph264"
-	"github.com/blackbeans/vdk/utils/bits/pio"
 	"github.com/pion/rtp"
 	"html"
 	"io"
@@ -51,6 +50,63 @@ const (
 	TEARDOWN = "TEARDOWN"
 )
 
+//缓存的avPacket
+type BufferedPacket struct {
+	IsKeyFrame      bool          // video packet is key frame
+	Idx             int8          // stream index in container format
+	CompositionTime time.Duration // packet presentation time minus decode time for H264 B-Frame
+	Time            time.Duration // packet decode time
+	Duration        time.Duration //packet duration
+	Buffered        *bytes.Buffer
+}
+
+func (pkt *BufferedPacket) Reset() {
+	pkt.IsKeyFrame = false
+	pkt.Idx = -1
+	pkt.CompositionTime = 0
+	pkt.Time = 0
+	pkt.Duration = 0
+	pkt.Buffered.Truncate(0)
+	pkt.Buffered.Reset()
+}
+
+func (pkt *BufferedPacket) AppendNalSlice(slice []byte) *BufferedPacket {
+	pkt.Buffered.Write(slice)
+	return pkt
+}
+
+func (pkt *BufferedPacket) Len() int {
+	return pkt.Buffered.Len()
+}
+
+func (pkt *BufferedPacket) NaluType() byte {
+	return pkt.Buffered.Bytes()[0] & 0x1f
+}
+
+func (pkt *BufferedPacket) Renew(idx int8, compositionTime time.Duration, duration, t time.Duration) *BufferedPacket {
+	pkt.Idx = idx
+	pkt.CompositionTime = compositionTime
+	pkt.Time = t
+	pkt.Duration = duration
+	pkt.Buffered.Truncate(0)
+	pkt.Buffered.Reset()
+	return pkt
+}
+
+//将数据组装为 avpacket
+func (pkt *BufferedPacket) toAvPacket() *av.Packet {
+	return &av.Packet{
+		CompositionTime: pkt.CompositionTime,
+		Idx:             pkt.Idx,
+		Data:            append(binSize(pkt.Buffered.Len()), pkt.Buffered.Bytes()...),
+		//取第一个字节是否为关键帧
+		IsKeyFrame: pkt.NaluType() == 5,
+		Duration:   pkt.Duration,
+		Time:       time.Duration(pkt.Time/90) * time.Millisecond,
+	}
+
+}
+
 type RTSPClient struct {
 	control             string
 	seq                 int
@@ -79,7 +135,7 @@ type RTSPClient struct {
 	fuStarted           bool
 	options             RTSPClientOptions
 	//缓存RTP包数据FU-A分片包的中间数据
-	BufferRtpPacket   *bytes.Buffer
+	BufferRtpPacket   *BufferedPacket
 	vps               []byte
 	sps               []byte
 	pps               []byte
@@ -110,13 +166,15 @@ func Dial(options RTSPClientOptions) (*RTSPClient, error) {
 		Signals:             make(chan int, 100),
 		OutgoingProxyQueue:  make(chan *[]byte, 3000),
 		OutgoingPacketQueue: make(chan *av.Packet, 3000),
-		BufferRtpPacket:     bytes.NewBuffer([]byte{}),
-		videoID:             -1,
-		audioID:             -2,
-		videoIDX:            -1,
-		audioIDX:            -2,
-		options:             options,
-		AudioTimeScale:      8000,
+		BufferRtpPacket: &BufferedPacket{
+			Buffered: bytes.NewBuffer(make([]byte, 0, 8*1024)),
+		},
+		videoID:        -1,
+		audioID:        -2,
+		videoIDX:       -1,
+		audioIDX:       -2,
+		options:        options,
+		AudioTimeScale: 8000,
 	}
 	client.headers["User-Agent"] = "Lavf58.20.100"
 	err := client.parseURL(html.UnescapeString(client.options.URL))
@@ -338,35 +396,36 @@ func (client *RTSPClient) startRTPStream(udpConn *net.UDPConn) {
 			client.Println("RTSP Client Read " + err.Error())
 			return
 		}
+		duration := time.Duration(float32(int64(header.Timestamp)-client.PreVideoTS)/90) * time.Millisecond
 
+		//组装包
+		pkt := client.BufferRtpPacket.Renew(
+			client.videoIDX,
+			1*time.Millisecond,
+			duration,
+			time.Duration(header.Timestamp),
+		)
 		for _, nalu := range nalus {
 			naluType := nalu[0] & 0x1f
-			pkt := &av.Packet{
-				Idx:  client.videoIDX,
-				Time: time.Duration(header.Timestamp) * time.Second / time.Duration(client.mediaSDP[client.videoIDX].TimeScale),
+			// 拼接数据包
+			switch {
+			case naluType >= 1 && naluType <= 5:
+				if naluType == 5 {
+					pkt.Buffered.Reset()
+				}
+				pkt.AppendNalSlice(nalu)
+			case naluType == h264parser.NALU_SPS:
+				client.CodecUpdateSPS(nalu)
+			case naluType == h264parser.NALU_PPS:
+				client.CodecUpdatePPS(nalu)
 			}
 
-			// 拼接数据包
-			var buf bytes.Buffer
-			switch naluType {
-			case 1, 2, 3, 4, 5:
-				if naluType == 5 {
-					pkt.IsKeyFrame = true
-				}
-				b := make([]byte, 4)
-				pio.PutU32BE(b[0:4], uint32(len(nalu)))
-				buf.Write(b)
-				buf.Write(nalu)
-			case h264parser.NALU_SPS:
-				client.CodecUpdateSPS(nalu)
-				continue
-			case h264parser.NALU_PPS:
-				client.CodecUpdatePPS(nalu)
-				continue
-			}
-			pkt.Data = buf.Bytes()
-			client.OutgoingPacketQueue <- pkt
 		}
+
+		if pkt.Len() > 0 {
+			client.OutgoingPacketQueue <- pkt.toAvPacket()
+		}
+		client.PreVideoTS = int64(header.Timestamp)
 
 	}
 }
@@ -700,7 +759,6 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		client.PreSequenceNumber = int(rtpPacket.SequenceNumber)
 		if client.BufferRtpPacket.Len() > 4048576 {
 			client.Println("Big Buffer Flush")
-			client.BufferRtpPacket.Truncate(0)
 			client.BufferRtpPacket.Reset()
 		}
 
@@ -724,14 +782,34 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		switch {
 		//单一分片的NALU
 		case naluType >= 1 && naluType <= 5:
-			retmap = append(retmap, &av.Packet{
-				Data:            append(binSize(len(rtpPayload)), rtpPayload...),
-				CompositionTime: time.Duration(1) * time.Millisecond,
-				Idx:             client.videoIDX,
-				IsKeyFrame:      naluType == 5,
-				Duration:        time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond,
-				Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
-			})
+			//前一个分片时间是0 或者 duration是0那么就是同一个包切分的不同slice
+			//开始第一个包那么就存储
+			if client.BufferRtpPacket.Len() <= 0 {
+				client.BufferRtpPacket.Renew(client.videoIDX,
+					time.Duration(1)*time.Millisecond,
+					duration,
+					time.Duration(rtpPacket.Timestamp)).
+					AppendNalSlice(rtpPayload)
+
+			} else {
+				//后续相同时间戳的包
+				if duration <= 0 {
+					//同分片数据
+					client.BufferRtpPacket.
+						AppendNalSlice([]byte{0x00, 0x00, 0x01}).
+						AppendNalSlice(rtpPayload)
+				} else {
+					//提交上一个包的数据
+					retmap = append(retmap, client.BufferRtpPacket.toAvPacket())
+
+					client.BufferRtpPacket.Renew(client.videoIDX,
+						time.Duration(1)*time.Millisecond,
+						duration,
+						time.Duration(rtpPacket.Timestamp)).
+						AppendNalSlice(rtpPayload)
+				}
+			}
+
 		case naluType == 7:
 			client.CodecUpdateSPS(rtpPayload)
 		case naluType == 8:
@@ -746,26 +824,30 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 			//帧分片结束
 			isEnd := fuHeader&0x40 != 0
 			if isStart {
+				if client.BufferRtpPacket.Len() > 0 {
+					//不一样的数据
+					retmap = append(retmap, client.BufferRtpPacket.toAvPacket())
+				}
+
 				client.fuStarted = true
-				client.BufferRtpPacket.Truncate(0)
-				client.BufferRtpPacket.Reset()
-				client.BufferRtpPacket.Write([]byte{nalFua})
+				client.BufferRtpPacket.Renew(
+					client.videoIDX,
+					time.Duration(1)*time.Millisecond,
+					duration,
+					time.Duration(rtpPacket.Timestamp)).
+					AppendNalSlice([]byte{nalFua})
 			}
 			if client.fuStarted {
-				client.BufferRtpPacket.Write(rtpPayload[2:])
+				client.BufferRtpPacket.AppendNalSlice(rtpPayload[2:])
 				if isEnd {
 					//中间或者是结束的包那么写入
 					client.fuStarted = false
-					naluTypef := client.BufferRtpPacket.Bytes()[0] & 0x1f
+					naluTypef := client.BufferRtpPacket.NaluType()
 					if naluTypef == 7 || naluTypef == 9 {
-						bufered, _ := h264parser.SplitNALUs(append([]byte{0x00, 0x00, 0x00, 0x01}, client.BufferRtpPacket.Bytes()...))
+						bufered, _ := h264parser.SplitNALUs(append([]byte{0x00, 0x00, 0x00, 0x01}, client.BufferRtpPacket.Buffered.Bytes()...))
 						for _, v := range bufered {
 							naluTypefs := v[0] & 0x1f
 							switch {
-							case naluTypefs == 5:
-								client.BufferRtpPacket.Reset()
-								client.BufferRtpPacket.Write(v)
-								naluTypef = 5
 							case naluTypefs == 7:
 								client.CodecUpdateSPS(v)
 							case naluTypefs == 8:
@@ -774,17 +856,9 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 						}
 					}
 
-					//写到文件里
-					pkt := &av.Packet{
-						Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
-						CompositionTime: time.Duration(1) * time.Millisecond,
-						Duration:        duration,
-						Idx:             client.videoIDX,
-						IsKeyFrame:      naluTypef == 5,
-						Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
-					}
+					retmap = append(retmap, client.BufferRtpPacket.toAvPacket())
+					client.BufferRtpPacket.Reset()
 
-					retmap = append(retmap, pkt)
 				}
 			}
 		default:
