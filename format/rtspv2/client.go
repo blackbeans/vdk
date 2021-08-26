@@ -17,7 +17,6 @@ import (
 	"math/rand"
 	"net"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -725,30 +724,14 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		switch {
 		//单一分片的NALU
 		case naluType >= 1 && naluType <= 5:
-			//前一个分片时间是0 或者 duration是0那么就是同一个包切分的不同slice
-			if duration <= 0 {
-				if client.BufferRtpPacket.Len() <= 0 {
-					client.BufferRtpPacket.Write(rtpPayload)
-				} else {
-					client.BufferRtpPacket.Write(append([]byte{0x00, 0x00, 0x01}, rtpPayload...))
-				}
-			} else if client.BufferRtpPacket.Len() > 0 {
-				//不一样的数据
-				pkt := &av.Packet{
-					CompositionTime: time.Duration(1) * time.Millisecond,
-					Idx:             client.videoIDX,
-					Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
-					//取第一个字节是否为关键帧
-					IsKeyFrame: client.BufferRtpPacket.Bytes()[0]&0x1f == 5,
-					Duration:   duration,
-					Time:       time.Duration(client.PreVideoTS/90) * time.Millisecond,
-				}
-				retmap = append(retmap, pkt)
-				//清空
-				client.BufferRtpPacket.Truncate(0)
-				client.BufferRtpPacket.Reset()
-				client.BufferRtpPacket.Write(rtpPayload)
-			}
+			retmap = append(retmap, &av.Packet{
+				Data:            append(binSize(len(rtpPayload)), rtpPayload...),
+				CompositionTime: time.Duration(1) * time.Millisecond,
+				Idx:             client.videoIDX,
+				IsKeyFrame:      naluType == 5,
+				Duration:        time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond,
+				Time:            time.Duration(rtpPacket.Timestamp/90) * time.Millisecond,
+			})
 		case naluType == 7:
 			client.CodecUpdateSPS(rtpPayload)
 		case naluType == 8:
@@ -763,20 +746,6 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 			//帧分片结束
 			isEnd := fuHeader&0x40 != 0
 			if isStart {
-				if client.BufferRtpPacket.Len() > 0 {
-					//不一样的数据
-					pkt := &av.Packet{
-						CompositionTime: time.Duration(1) * time.Millisecond,
-						Idx:             client.videoIDX,
-						Data:            append(binSize(client.BufferRtpPacket.Len()), client.BufferRtpPacket.Bytes()...),
-						//取第一个字节是否为关键帧
-						IsKeyFrame: client.BufferRtpPacket.Bytes()[0]&0x1f == 5,
-						Duration:   duration,
-						Time:       time.Duration(client.PreVideoTS/90) * time.Millisecond,
-					}
-					retmap = append(retmap, pkt)
-				}
-
 				client.fuStarted = true
 				client.BufferRtpPacket.Truncate(0)
 				client.BufferRtpPacket.Reset()
@@ -816,8 +785,6 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 					}
 
 					retmap = append(retmap, pkt)
-					client.BufferRtpPacket.Truncate(0)
-					client.BufferRtpPacket.Reset()
 				}
 			}
 		default:
