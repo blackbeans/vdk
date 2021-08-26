@@ -80,12 +80,13 @@ func (pkt *BufferedPacket) Len() int {
 }
 
 func (pkt *BufferedPacket) NaluType() byte {
-	return pkt.Buffered.Bytes()[0] & 0x1f
+	return pkt.Buffered.Bytes()[0] & 0x1F
 }
 
 func (pkt *BufferedPacket) Renew(idx int8, compositionTime time.Duration, duration, t time.Duration) *BufferedPacket {
 	pkt.Idx = idx
 	pkt.CompositionTime = compositionTime
+	pkt.IsKeyFrame = false
 	pkt.Time = t
 	pkt.Duration = duration
 	pkt.Buffered.Truncate(0)
@@ -772,42 +773,35 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		fuIndicator := rtpPayload[0]
 		fuHeader := rtpPayload[1]
 		naluType := fuIndicator & 0x1f //获取FU indicator的类型域
-		//获取FU header的前三位，判断当前是分包的开始、中间或结束
-		flag := fuIndicator & 0xe0
-		//nal Fua
-		nalFua := flag | (fuHeader & 0x1f)
+		duration := time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond
+
+		// paylay 第三个字节 最高位 0 继续组包， 如果是1组装之前的帧，1后的继续组包。
+		//帧分片开始
+		isFirstSlice := fuHeader&0x80 != 0
 
 		var retmap []*av.Packet
-		duration := time.Duration(float32(int64(rtpPacket.Timestamp)-client.PreVideoTS)/90) * time.Millisecond
+
 		switch {
 		//单一分片的NALU
 		case naluType >= 1 && naluType <= 5:
-			//前一个分片时间是0 或者 duration是0那么就是同一个包切分的不同slice
-			//开始第一个包那么就存储
-			if client.BufferRtpPacket.Len() <= 0 {
-				client.BufferRtpPacket.Renew(client.videoIDX,
+			//新的一帧的第一个切片
+			if isFirstSlice {
+				if client.BufferRtpPacket.Len() > 0 {
+					//前一个包已经完成了
+					retmap = append(retmap, client.BufferRtpPacket.toAvPacket())
+					client.PreVideoTS = int64(client.BufferRtpPacket.Time)
+				}
+				client.BufferRtpPacket.Renew(
+					client.videoIDX,
 					time.Duration(1)*time.Millisecond,
 					duration,
 					time.Duration(rtpPacket.Timestamp)).
 					AppendNalSlice(rtpPayload)
-
 			} else {
-				//后续相同时间戳的包
-				if duration <= 0 {
-					//同分片数据
-					client.BufferRtpPacket.
-						AppendNalSlice([]byte{0x00, 0x00, 0x01}).
-						AppendNalSlice(rtpPayload)
-				} else {
-					//提交上一个包的数据
-					retmap = append(retmap, client.BufferRtpPacket.toAvPacket())
-
-					client.BufferRtpPacket.Renew(client.videoIDX,
-						time.Duration(1)*time.Millisecond,
-						duration,
-						time.Duration(rtpPacket.Timestamp)).
-						AppendNalSlice(rtpPayload)
-				}
+				//同分片数据
+				client.BufferRtpPacket.
+					AppendNalSlice([]byte{0x00, 0x00, 0x01}).
+					AppendNalSlice(rtpPayload)
 			}
 
 		case naluType == 7:
@@ -818,55 +812,49 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 			client.Println("24 Type need add next version report https://github.com/blackbeans/vdk")
 		case naluType == 0x1c:
 
-			// paylay 第三个字节 最高位 0 继续组包， 如果是1组装之前的帧，1后的继续组包。
-			//帧分片开始
-			isStart := fuHeader&0x80 != 0
+			nalFua := (fuIndicator & 0xe0) | (fuHeader & 0x1f)
+
 			//帧分片结束
 			isEnd := fuHeader&0x40 != 0
-			if isStart {
+			//新的一帧的第一个切片
+			if isFirstSlice {
 				if client.BufferRtpPacket.Len() > 0 {
-					//不一样的数据
+					//前一个包已经完成了
 					retmap = append(retmap, client.BufferRtpPacket.toAvPacket())
+					client.PreVideoTS = int64(client.BufferRtpPacket.Time)
 				}
 
-				client.fuStarted = true
 				client.BufferRtpPacket.Renew(
 					client.videoIDX,
 					time.Duration(1)*time.Millisecond,
 					duration,
-					time.Duration(rtpPacket.Timestamp)).
-					AppendNalSlice([]byte{nalFua})
-			}
-			if client.fuStarted {
-				client.BufferRtpPacket.AppendNalSlice(rtpPayload[2:])
-				if isEnd {
-					//中间或者是结束的包那么写入
-					client.fuStarted = false
-					naluTypef := client.BufferRtpPacket.NaluType()
-					if naluTypef == 7 || naluTypef == 9 {
-						bufered, _ := h264parser.SplitNALUs(append([]byte{0x00, 0x00, 0x00, 0x01}, client.BufferRtpPacket.Buffered.Bytes()...))
-						for _, v := range bufered {
-							naluTypefs := v[0] & 0x1f
-							switch {
-							case naluTypefs == 7:
-								client.CodecUpdateSPS(v)
-							case naluTypefs == 8:
-								client.CodecUpdatePPS(v)
-							}
-						}
-					}
+					time.Duration(rtpPacket.Timestamp))
 
-					retmap = append(retmap, client.BufferRtpPacket.toAvPacket())
-					client.BufferRtpPacket.Reset()
+				//全新的fu-a的包
+				client.BufferRtpPacket.AppendNalSlice([]byte{nalFua})
+				client.fuStarted = true
+			} else {
+				//中间slice 采用fu-a传输，并且是fu-a第一个单元，
+				if !client.fuStarted {
+					client.BufferRtpPacket.AppendNalSlice([]byte{nalFua})
+					client.fuStarted = true
+				} else {
+					//是fu-a非第一个单元，那么需要
 
 				}
 			}
+			client.BufferRtpPacket.AppendNalSlice(rtpPayload[2:])
+
+			//最后的分片结束了
+			if isEnd {
+				client.fuStarted = false
+			}
+
 		default:
 			client.Println("Unsupported NAL Type", naluType)
 		}
 
 		if len(retmap) > 0 {
-			client.PreVideoTS = int64(rtpPacket.Timestamp)
 			return retmap, true
 		}
 	case client.audioID:
